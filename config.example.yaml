@@ -1,0 +1,63 @@
+# FuseTrace 設定檔
+# 只支援兩層結構（section: key: value）；若已安裝 PyYAML 則使用完整 YAML 解析。
+
+source:
+  # Binance USDⓈ-M Futures 全市場爆倉串流（公開、免 API Key）
+  # 注意：2026-03 起 Binance 將 WS 拆成 /public、/market、/private，!forceOrder@arr 屬於 /market。
+  # 舊的 wss://fstream.binance.com/ws/... 已於 2026-04-23 停用（程式會自動改寫，但請更新設定）。
+  ws_url: "wss://fstream.binance.com/market/ws/!forceOrder@arr"
+  rest_url: "https://fapi.binance.com"   # 前兆歸因用的公開 REST（免 Key）
+
+detection:
+  window_seconds: 60          # 滑動視窗長度
+  min_total_usd: 10_000_000   # 視窗內總爆倉額低於此值不觸發（測試時可先調低，例如 500_000）
+  min_symbols: 3              # 至少幾個幣種同時爆倉，才算「連環」而非單一幣種插針
+  baseline_minutes: 60        # 基線回看分鐘數（分鐘桶，最多 60 個，幾乎不佔記憶體）
+  min_baseline_minutes: 10    # 基線樣本不足時只用絕對閾值（暖機期）
+  baseline_multiplier: 5.0    # 視窗爆倉額須達「基線同長度平均值」的幾倍
+  end_ratio: 0.5              # 視窗總額降到 min_total_usd * end_ratio 以下開始計算平息
+  quiet_seconds: 30           # 連續平息多久後結束事件
+  max_timeline_rows: 5000     # 單一事件最多寫入的時間軸列數（統計數字仍完整累計）
+
+storage:
+  path: fusetrace.db
+  retention_days: 30                # 自動清理超過 N 天的資料，0 = 不清理
+  store_all_liquidations: true      # 是否保存所有原始爆倉（replay 的一致性檢查會用到）
+
+telegram:
+  enabled: false                    # 設為 true 並填好下面兩欄即可啟用推播
+  # 1) 向 @BotFather 建立機器人取得 token
+  # 2) 對你的機器人（或把它加進群組）發一則訊息，再用 @userinfobot 或
+  #    https://api.telegram.org/bot<token>/getUpdates 查出 chat_id（群組通常是 -100 開頭）
+  # 安全提醒：開源專案請勿把真實 token commit 上去，
+  # 建議改用環境變數 FUSETRACE_TG_TOKEN / FUSETRACE_TG_CHAT_ID（優先於本檔）
+  bot_token: "YOUR_BOT_TOKEN"       # 格式類似 123456789:AAxxxxxxxx
+  chat_id: "YOUR_CHAT_ID"
+  notify_on_open: true              # 偵測到 Cascade 時推播
+  notify_on_close: true             # Cascade 結束（或被中斷）時推播摘要
+  timeout_seconds: 10
+
+precursor:
+  # 前兆歸因：事件觸發時，對候選幣種查「事件前 N 分鐘」的價格 / OI / 資金費率，
+  # 把「疑似起火點」從「誰最早爆倉」升級為「誰先出現異動證據」。
+  # 平時 0 個請求；每次事件約 12 個公開 REST 請求（4 個幣種 x 3 個端點），有冷卻與限流退避。
+  enabled: true
+  lookback_minutes: 15
+  top_k: 3                  # 候選 = 視窗內爆倉額前 K 名
+  include_first_seen: true  # 另外把「最早出現爆倉的幣種」也納入候選
+  max_workers: 3            # 同時最多幾個請求（刻意壓低，避免被限流）
+  request_timeout: 4        # 單一請求逾時（秒）
+  wait_seconds: 4           # OPEN 警報最多等證據幾秒；逾時先送出，證據之後補進資料庫與 CLOSE 訊息
+  cooldown_seconds: 120     # 兩次取數的最短間隔，避免行情連續震盪時重複打 API
+  backoff_seconds: 300      # 遇到 429/418 後暫停取數的最短秒數（會尊重 Retry-After）
+  min_score: 0.25           # 最高分低於此值 -> 不宣稱起火點，只標示「最早出現」
+  # 分數 = 加權和（缺少的證據算 0）；各項以 scale 正規化後截斷在 0~1
+  price_scale_pct: 2.0      # 價格朝爆倉方向移動達此 % 即滿分
+  oi_scale_pct: 5.0         # OI 堆高達此 % 即滿分（用幣本位數量，排除價格影響）
+  funding_scale_pct: 0.05   # 資金費率偏向擁擠方向達此 % 即滿分
+  weight_price: 0.5
+  weight_oi: 0.3
+  weight_funding: 0.2
+
+logging:
+  level: INFO
