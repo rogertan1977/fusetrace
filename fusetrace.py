@@ -13,6 +13,7 @@
   python fusetrace.py --replay <event_id>   # 重播事件（可用 latest 或 id 前綴）
   python fusetrace.py --test-telegram       # 發送一則測試訊息，驗證 token / chat_id
   python fusetrace.py --probe ETHUSDT       # 對單一幣種試跑前兆取數，驗證 REST 端點可用
+  python fusetrace.py --attribute <event_id>  # 對歷史事件補跑 / 重跑前兆歸因（可用 latest 或 id 前綴）
 """
 from __future__ import annotations
 
@@ -50,6 +51,7 @@ DEFAULTS: dict = {
         # !forceOrder@arr 屬於 /market，舊的 /ws/ 路徑已停用
         "ws_url": "wss://fstream.binance.com/market/ws/!forceOrder@arr",
         "rest_url": "https://fapi.binance.com",
+        "dapi_rest_url": "https://dapi.binance.com",
     },
     "detection": {
         "window_seconds": 60,
@@ -167,6 +169,13 @@ def load_config(path: str) -> dict:
     return cfg
 
 
+def is_coin_m(symbol: str) -> bool:
+    """識別幣本位反向合約（例如 BTCUSD_PERP、BTCUSD_261225、BNBUSD_PERP）。
+    線性 U 本位交割合約（如 BTCUSDT_261225）底線前為 USDT/USDC，不屬於幣本位。
+    """
+    return "_" in symbol and symbol.split("_", 1)[0].endswith("USD")
+
+
 # --------------------------------------------------------------------------
 # 資料模型與解析
 # --------------------------------------------------------------------------
@@ -190,9 +199,19 @@ def parse_force_order(msg: dict) -> Liq | None:
     o = msg.get("o")
     if not o:
         return None
+    sym = o["s"]
     price = float(o.get("ap") or 0) or float(o.get("p") or 0)   # 優先用成交均價
     qty = float(o.get("z") or 0) or float(o.get("q") or 0)      # 優先用已成交量
-    notional = price * qty
+    if price <= 0 or qty <= 0:
+        return None
+
+    # 幣本位反向合約的 qty 為「張數」而非幣數：BTCUSD_* 1張=$100，其餘 *USD_* 1張=$10
+    if is_coin_m(sym):
+        contract_usd = 100.0 if sym.startswith("BTCUSD") else 10.0
+        notional = qty * contract_usd
+    else:
+        notional = price * qty
+
     if notional <= 0:
         return None
     now = time.time()
@@ -200,7 +219,7 @@ def parse_force_order(msg: dict) -> Liq | None:
     ts = ts_ms / 1000.0 if ts_ms else now
     # 強平單方向：SELL = 多單被強制平倉；BUY = 空單被強制平倉
     side = "LONG" if o.get("S") == "SELL" else "SHORT"
-    return Liq(ts, now, o["s"], side, price, qty, notional)
+    return Liq(ts, now, sym, side, price, qty, notional)
 
 
 # --------------------------------------------------------------------------
@@ -361,14 +380,7 @@ def fmt_ts(ts: float) -> str:
 
 
 # --------------------------------------------------------------------------
-# 前兆歸因（Precursor Attribution）
-#
-# 設計原則：平時 0 請求。只有 Cascade 觸發時，才對「候選幣種」（視窗內爆倉額前 K 名
-# + 最早出現的幣種，至多約 4 個）各發 3 個公開 REST 請求，合計 ~12 個請求 / 每次事件：
-#   GET /fapi/v1/klines               1m K 線  -> 事件前 N 分鐘價格變化
-#   GET /futures/data/openInterestHist 5m 統計 -> 事件前 N 分鐘 OI 變化（文件標示權重 0）
-#   GET /fapi/v1/premiumIndex          標記價與資金費率
-# 全部為公開端點、免 API Key。含冷卻、併發上限、429/418 退避。
+# 前兆歸因（Precursor Attribution）- 支援 fapi (U本位) 與 dapi (幣本位) 自動分流
 # --------------------------------------------------------------------------
 class RestError(Exception):
     pass
@@ -392,7 +404,7 @@ class BinanceREST:
         if time.time() < self.blocked_until:
             raise RestBlocked("REST paused after rate limit")
         url = f"{self.base}{path}?{urllib.parse.urlencode(params)}"
-        req = urllib.request.Request(url, headers={"User-Agent": "fusetrace/0.3 (public data only)"})
+        req = urllib.request.Request(url, headers={"User-Agent": "fusetrace/0.4 (public data only)"})
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 with self._lock:
@@ -418,38 +430,43 @@ class BinanceREST:
 
 
 class PrecursorEngine:
-    def __init__(self, rest: BinanceREST, lookback_min: int, max_workers: int) -> None:
+    def __init__(self, rest: BinanceREST, lookback_min: int, max_workers: int,
+                 dapi_rest: BinanceREST | None = None) -> None:
         self.rest = rest
+        self.dapi_rest = dapi_rest
         self.lookback = lookback_min
         self.max_workers = max(1, max_workers)
 
-    def collect(self, symbols: list[str], t_ref: float) -> dict[str, dict]:
-        """在背景線程中呼叫（阻塞式）。回傳 {symbol: evidence}，任何失敗都只記進 errors。"""
+    def collect(self, symbols: list[str], t_ref: float, historical: bool = False) -> dict[str, dict]:
         if not symbols:
             return {}
         with ThreadPoolExecutor(max_workers=min(self.max_workers, len(symbols))) as pool:
-            return dict(zip(symbols, pool.map(lambda s: self._one(s, t_ref), symbols)))
+            return dict(zip(symbols, pool.map(lambda s: self._one(s, t_ref, historical), symbols)))
 
-    def _one(self, sym: str, t_ref: float) -> dict:
+    def _one(self, sym: str, t_ref: float, historical: bool = False) -> dict:
         ev: dict = {"price_pct": None, "price_span_min": None, "oi_pct": None,
                     "oi_span_min": None, "funding_pct": None, "errors": []}
         t0 = t_ref - self.lookback * 60
-        for name, fn in (("price", self._price), ("oi", self._oi), ("funding", self._funding)):
+        funding_fn = self._funding_hist if historical else self._funding
+        for name, fn in (("price", self._price), ("oi", self._oi), ("funding", funding_fn)):
             try:
                 fn(sym, t0, t_ref, ev)
             except RestError as e:
                 ev["errors"].append(f"{name}: {e}")
-            except Exception as e:   # 資料格式非預期等，不能讓它炸掉主流程
+            except Exception as e:
                 ev["errors"].append(f"{name}: {type(e).__name__}")
         return ev
 
     def _price(self, sym: str, t0: float, t_ref: float, ev: dict) -> None:
-        rows = self.rest.get("/fapi/v1/klines", {
+        cm = is_coin_m(sym)
+        client = self.dapi_rest if (cm and self.dapi_rest) else self.rest
+        path = "/dapi/v1/klines" if cm else "/fapi/v1/klines"
+        rows = client.get(path, {
             "symbol": sym, "interval": "1m",
             "startTime": int((t0 - 60) * 1000), "endTime": int((t_ref + 60) * 1000),
             "limit": self.lookback + 5,
         })
-        a = b = None   # (openTime_ms, open)：包含 t0 的那根 / 包含 t_ref 的那根
+        a = b = None
         for r in rows:
             ot, o = int(r[0]), float(r[1])
             if ot <= t0 * 1000:
@@ -461,12 +478,23 @@ class PrecursorEngine:
             ev["price_span_min"] = (b[0] - a[0]) / 60000.0
 
     def _oi(self, sym: str, t0: float, t_ref: float, ev: dict) -> None:
-        rows = self.rest.get("/futures/data/openInterestHist", {
-            "symbol": sym, "period": "5m",
-            "startTime": int((t0 - 600) * 1000), "endTime": int((t_ref + 300) * 1000),
-            "limit": self.lookback // 5 + 8,
-        })
-        a = b = None   # 用幣本位數量 sumOpenInterest，避免價格下跌造成 USD 計價 OI 的假性下降
+        cm = is_coin_m(sym)
+        if cm:
+            if not (self.dapi_rest and sym.endswith("_PERP")):
+                return  # dapi openInterestHist 依 pair+contractType 聚合，跳過非永續交割合約避免雜訊
+            pair = sym.split("_", 1)[0]
+            rows = self.dapi_rest.get("/futures/data/openInterestHist", {
+                "pair": pair, "contractType": "PERPETUAL", "period": "5m",
+                "startTime": int((t0 - 600) * 1000), "endTime": int((t_ref + 300) * 1000),
+                "limit": self.lookback // 5 + 8,
+            })
+        else:
+            rows = self.rest.get("/futures/data/openInterestHist", {
+                "symbol": sym, "period": "5m",
+                "startTime": int((t0 - 600) * 1000), "endTime": int((t_ref + 300) * 1000),
+                "limit": self.lookback // 5 + 8,
+            })
+        a = b = None
         for r in rows:
             ts, v = int(r["timestamp"]), float(r["sumOpenInterest"])
             if ts <= t0 * 1000:
@@ -478,20 +506,46 @@ class PrecursorEngine:
             ev["oi_span_min"] = (b[0] - a[0]) / 60000.0
 
     def _funding(self, sym: str, t0: float, t_ref: float, ev: dict) -> None:
-        d = self.rest.get("/fapi/v1/premiumIndex", {"symbol": sym})
+        cm = is_coin_m(sym)
+        if cm and not sym.endswith("_PERP"):
+            return  # 交割合約無資金費率
+        client = self.dapi_rest if (cm and self.dapi_rest) else self.rest
+        path = "/dapi/v1/premiumIndex" if cm else "/fapi/v1/premiumIndex"
+        d = client.get(path, {"symbol": sym})
         if isinstance(d, list):
             d = d[0] if d else {}
         fr = d.get("lastFundingRate")
         if fr not in (None, ""):
             ev["funding_pct"] = float(fr) * 100.0
 
+    def _funding_hist(self, sym: str, t0: float, t_ref: float, ev: dict) -> None:
+        cm = is_coin_m(sym)
+        if cm and not sym.endswith("_PERP"):
+            return
+        client = self.dapi_rest if (cm and self.dapi_rest) else self.rest
+        path = "/dapi/v1/fundingRate" if cm else "/fapi/v1/fundingRate"
+        rows = client.get(path, {
+            "symbol": sym, "startTime": int((t_ref - 9 * 3600) * 1000),
+            "endTime": int(t_ref * 1000), "limit": 12,
+        })
+        last = None
+        for r in rows:
+            if int(r["fundingTime"]) <= t_ref * 1000:
+                last = r
+        if last is not None:
+            ev["funding_pct"] = float(last["fundingRate"]) * 100.0
+
 
 def make_engine(cfg: dict) -> PrecursorEngine | None:
     p = cfg["precursor"]
     if not p.get("enabled"):
         return None
-    rest = BinanceREST(cfg["source"]["rest_url"], float(p["request_timeout"]), float(p["backoff_seconds"]))
-    return PrecursorEngine(rest, int(p["lookback_minutes"]), int(p["max_workers"]))
+    timeout = float(p["request_timeout"])
+    backoff = float(p["backoff_seconds"])
+    rest = BinanceREST(cfg["source"]["rest_url"], timeout, backoff)
+    dapi_url = cfg["source"].get("dapi_rest_url", "https://dapi.binance.com")
+    dapi_rest = BinanceREST(dapi_url, timeout, backoff)
+    return PrecursorEngine(rest, int(p["lookback_minutes"]), int(p["max_workers"]), dapi_rest=dapi_rest)
 
 
 def pc_params(cfg: dict) -> dict:
@@ -513,11 +567,6 @@ def _clamp01(x: float) -> float:
 
 
 def score_evidence(e: dict, dominant: str, pc: dict) -> tuple[float, int]:
-    """可解釋的啟發式分數（0~1）。缺少的證據視為 0（沒有證據就不加分）。
-
-    dominant = "LONG"：多單被爆為主 -> 前兆是「下跌、OI 堆高、資金費率偏正（多頭擁擠）」
-    dominant = "SHORT"：空單被爆為主 -> 前兆是「上漲、OI 堆高、資金費率偏負（空頭擁擠）」
-    """
     score, n = 0.0, 0
     if e.get("price_pct") is not None:
         adverse = -e["price_pct"] if dominant == "LONG" else e["price_pct"]
@@ -534,7 +583,6 @@ def score_evidence(e: dict, dominant: str, pc: dict) -> tuple[float, int]:
 
 
 def rank_candidates(cands: list[tuple], evid: dict, dominant: str, pc: dict, t_ref: float) -> list[dict]:
-    """cands: [(symbol, window_notional, first_seen_ts)] -> 依分數排序的完整資料列（可直接入庫）。"""
     rows = []
     for sym, notional, first_ts in cands:
         e = evid.get(sym) or {}
@@ -566,7 +614,6 @@ def fmt_evidence(r: dict) -> str:
 
 
 def normalize_ws_url(url: str) -> str:
-    """舊版 /ws/ 路徑已於 2026-04-23 停用：自動改寫成 /market/ws/，避免「連上了卻沒資料」。"""
     legacy = "wss://fstream.binance.com/ws/"
     if url.startswith(legacy):
         new = "wss://fstream.binance.com/market/ws/" + url[len(legacy):]
@@ -582,17 +629,15 @@ _MD_SPECIAL = re.compile(r"([_*\[\]()~`>#+\-=|{}.!\\])")
 
 
 def md(s) -> str:
-    """跳脫 MarkdownV2 保留字元。所有動態內容都必須先經過這裡。"""
     return _MD_SPECIAL.sub(r"\\\1", str(s))
 
 
 def _plain(text: str) -> str:
-    """MarkdownV2 -> 純文字（解析失敗時的備援）。"""
     return re.sub(r"\\(.)", r"\1", text).replace("*", "").replace("`", "")
 
 
 class TelegramNotifier:
-    API = "https://api.telegram.org"   # 測試時可改成本機假伺服器
+    API = "https://api.telegram.org"
 
     def __init__(self, token: str, chat_id: str, timeout: float = 10.0) -> None:
         self.token = token
@@ -603,14 +648,12 @@ class TelegramNotifier:
         self.thread.start()
 
     def send(self, text: str) -> None:
-        """非阻塞：丟進佇列即返回，由背景線程實際送出。"""
         try:
             self.q.put_nowait(text)
         except queue.Full:
             log.warning("telegram queue full, message dropped")
 
     def close(self, timeout: float = 8.0) -> None:
-        """等待佇列送完（最多 timeout 秒），確保結束訊息不會被吞掉。"""
         try:
             self.q.put(None, timeout=1)
         except queue.Full:
@@ -640,7 +683,6 @@ class TelegramNotifier:
             resp.read()
 
     def deliver(self, text: str) -> bool:
-        """同步送出（含重試）。回傳是否成功。日誌中絕不輸出 token / URL。"""
         parse_mode: str | None = "MarkdownV2"
         for attempt in range(3):
             try:
@@ -675,7 +717,6 @@ def make_notifier(cfg: dict, force: bool = False) -> TelegramNotifier | None:
     t = cfg.get("telegram", {})
     if not (t.get("enabled") or force):
         return None
-    # 環境變數優先，避免把 token 寫進檔案後不小心 commit 到 GitHub
     token = os.environ.get("FUSETRACE_TG_TOKEN") or str(t.get("bot_token") or "")
     chat = os.environ.get("FUSETRACE_TG_CHAT_ID") or str(t.get("chat_id") or "")
     if ":" not in token or not chat or chat.startswith("YOUR_"):
@@ -690,7 +731,6 @@ def _top_line(items: list[tuple[str, float]]) -> str:
 
 @dataclass(slots=True)
 class OpenSnap:
-    """觸發當下的視窗快照。背景取數期間事件仍在累積，訊息必須使用觸發時的數字。"""
     total: float
     long: float
     short: float
@@ -707,42 +747,43 @@ def msg_open(eid: str, snap: OpenSnap, window_s: float, attr: list | None) -> st
     dom = "📉" if snap.long >= snap.short else "📈"
     first_sym, first_ts = snap.first if snap.first else ("?", snap.now)
 
-    t_window = md(f"{int(window_s)}s window")
+    t_head = md("发现爆仓浪潮 (CASCADE DETECTED)")
+    t_window = md(f"{int(window_s)}s 窗口")
     t_total = md(fmt_usd(snap.total))
     t_long = md(f"{long_pct:.0f}%")
     t_short = md(f"{short_pct:.0f}%")
     t_top = md(_top_line(snap.top))
-    t_note = md("Statistical inference from public data, not financial advice.")
+    t_note = md("基于公开数据的统计推断，不作为财务建议。")
 
     if attr and attr[0]["is_ignition"]:
         best = attr[0]
         seen = fmt_ts(best["first_seen_ts"] or first_ts)
         ign = [
-            f"🧨 *Likely ignition*: *{md(best['symbol'])}* {md('(score %.2f)' % best['score'])}",
+            f"🧨 *{md('疑似起火点')}*: *{md(best['symbol'])}* {md('(评分 %.2f)' % best['score'])}",
             f"      📊 {md(fmt_evidence(best))}",
-            f"      {md('first liquidation seen ' + seen)}",
+            f"      {md('最早出现 ' + seen)}",
         ]
     else:
         lead = max(0.0, snap.now - first_ts)
         ign = [
-            f"🧨 *First seen*: {md(f'{first_sym} @ {fmt_ts(first_ts)}')}",
-            f"      {md(f'(first seen {lead:.0f}s before trigger)')}",
+            f"🧨 *{md('最早出现')}*: {md(f'{first_sym} @ {fmt_ts(first_ts)}')}",
+            f"      {md(f'(最早出现于触发前 {lead:.0f}s)')}",
         ]
         if attr:
-            ign.append(f"      ⚠️ {md('no clear precursors (best score %.2f)' % attr[0]['score'])}")
+            ign.append(f"      ⚠️ {md('无明显前兆 (最高评分 %.2f)' % attr[0]['score'])}")
     if attr and len(attr) > 1:
         others = " · ".join("%s %.2f" % (r["symbol"], r["score"]) for r in attr[1:])
-        ign.append(f"🔎 {md('Also checked: ' + others)}")
+        ign.append(f"🔎 {md('同时检查: ' + others)}")
 
     return "\n".join([
-        "🚨 *CASCADE DETECTED*",
+        f"🚨 *{t_head}*",
         f"🆔 `{eid}`",
         "",
         f"💥 *{t_window}*: *{t_total}*",
-        f"{dom} Long liq *{t_long}* · Short liq *{t_short}*",
-        f"🔥 Symbols firing: *{snap.n_symbols}*",
+        f"{dom} {md('多单爆仓')} *{t_long}* · {md('空单爆仓')} *{t_short}*",
+        f"🔥 {md('爆仓币种数')}: *{snap.n_symbols}*",
         *ign,
-        f"🏆 Top: {t_top}",
+        f"🏆 {md('爆仓榜首')}: {t_top}",
         "",
         f"_{t_note}_",
     ])
@@ -753,29 +794,32 @@ def msg_close(ev: Event, status: str, attr: list | None = None) -> str:
     long_pct = 100.0 * ev.long / total
     short_pct = 100.0 - long_pct
     dur = (ev.last_ts or 0.0) - (ev.started_at or 0.0)
-    head = "✅ *CASCADE CLOSED*" if status == "closed" else "⚠️ *CASCADE INTERRUPTED*"
+    if status == "closed":
+        head = f"✅ *{md('爆仓浪潮结束 (CASCADE CLOSED)')}*"
+    else:
+        head = f"⚠️ *{md('爆仓浪潮中断 (CASCADE INTERRUPTED)')}*"
     first_sym, first_ts = ev.first if ev.first else ("?", 0.0)
 
     if attr and attr[0]["is_ignition"]:
         best = attr[0]
         ign = [
-            f"🧨 Ignition: *{md(best['symbol'])}* {md('(score %.2f)' % best['score'])}",
+            f"🧨 {md('疑似起火点')}: *{md(best['symbol'])}* {md('(评分 %.2f)' % best['score'])}",
             f"      📊 {md(fmt_evidence(best))}",
         ]
     else:
-        ign = [f"🧨 First seen: {md(f'{first_sym} @ {fmt_ts(first_ts)}')}"]
+        ign = [f"🧨 {md('最早出现')}: {md(f'{first_sym} @ {fmt_ts(first_ts)}')}"]
 
     return "\n".join([
         head,
         f"🆔 `{ev.id}`",
         "",
-        f"⏱ Duration: *{md(f'{dur:.0f}s')}*",
-        f"💰 Total: *{md(fmt_usd(ev.total))}* {md(f'({ev.n} liquidations)')}",
-        f"📈 Peak {md('window')}: *{md(fmt_usd(ev.peak))}*",
-        f"⚖️ Long liq *{md(f'{long_pct:.0f}%')}* · Short liq *{md(f'{short_pct:.0f}%')}*",
-        f"🔥 Symbols: *{len(ev.by_symbol)}*",
+        f"⏱ {md('持续时间')}: *{md(f'{dur:.0f}s')}*",
+        f"💰 {md('总爆仓额')}: *{md(fmt_usd(ev.total))}* {md(f'({ev.n} 笔爆仓)')}",
+        f"📈 {md('视窗峰值')}: *{md(fmt_usd(ev.peak))}*",
+        f"⚖️ {md('多单爆仓')} *{md(f'{long_pct:.0f}%')}* · {md('空单爆仓')} *{md(f'{short_pct:.0f}%')}*",
+        f"🔥 {md('爆仓币种数')}: *{len(ev.by_symbol)}*",
         *ign,
-        f"🏆 Top: {md(_top_line(ev.top(3)))}",
+        f"🏆 {md('爆仓榜首')}: {md(_top_line(ev.top(3)))}",
         "",
         f"🔁 `python fusetrace.py --replay {ev.id}`",
     ])
@@ -814,9 +858,8 @@ class CascadeDetector:
         self._last_save = 0.0
         self._last_enrich = -1e9
         self._tasks: set[asyncio.Task] = set()
-        self._attr: dict[str, list] = {}   # event_id -> 前兆排名（供 CLOSE 訊息使用）
+        self._attr: dict[str, list] = {}
 
-    # ----------------------------------------------------------- 資料進入
     def on_liq(self, liq: Liq) -> None:
         self.msg_count += 1
         self.last_msg = liq.arrival
@@ -827,7 +870,6 @@ class CascadeDetector:
         if self.event:
             self.event.add(liq)
 
-    # ----------------------------------------------------------- 週期檢查
     def tick(self, now: float) -> None:
         self.window.expire(now)
         w = self.window
@@ -848,12 +890,11 @@ class CascadeDetector:
         if w.total < self.min_total or w.n_symbols < self.min_symbols:
             return False
         base = self.baseline.avg_per_minute(now, self.window_s, self.min_base_min)
-        if base is None:      # 基線暖機中：只用絕對閾值
+        if base is None:
             return True
         return w.total >= self.mult * base * (self.window_s / 60.0)
 
     def _notify(self, enabled: bool, build) -> None:
-        """組訊息並丟給背景線程；任何錯誤都不能影響偵測主流程。"""
         if not (self.notifier and enabled):
             return
         try:
@@ -861,9 +902,7 @@ class CascadeDetector:
         except Exception:
             log.exception("failed to build/send telegram message")
 
-    # ----------------------------------------------------------- 事件開始
     def _candidates(self, ev: Event) -> list[tuple]:
-        """候選起火點：視窗內爆倉額前 K 名，加上最早出現爆倉的幣種。"""
         w = self.window
         top = sorted(w.by_symbol.items(), key=lambda kv: kv[1], reverse=True)[: self.pc["top_k"]]
         first_by: dict[str, float] = {}
@@ -878,7 +917,7 @@ class CascadeDetector:
         w = self.window
         eid = time.strftime("%Y%m%d-%H%M%S", time.gmtime(now))
         ev = Event(eid, w.total, now, self.max_tl)
-        for l in list(w.items):          # 回填視窗內已發生的爆倉，時間軸才完整
+        for l in list(w.items):
             ev.add(l)
         self.event = ev
         self.db.upsert_event(ev.to_row())
@@ -906,7 +945,6 @@ class CascadeDetector:
 
     async def _enrich(self, eid: str, snap: OpenSnap, cands: list[tuple], dominant: str,
                       t_ref: float) -> None:
-        """背景取數 -> 排名 -> 發 OPEN 警報（最多等 wait_seconds）-> 入庫。不阻塞偵測迴圈。"""
         loop = asyncio.get_running_loop()
         symbols = [c[0] for c in cands]
         fut = loop.run_in_executor(None, self.engine.collect, symbols, t_ref)
@@ -925,7 +963,7 @@ class CascadeDetector:
                 self._attr[eid] = attr
             self._notify(self.tg_open, lambda: msg_open(eid, snap, self.window_s, attr))
             sent = True
-            if evid is None and not fut.done():     # 逾時：背景繼續等，供入庫與 CLOSE 訊息使用
+            if evid is None and not fut.done():
                 try:
                     evid = await fut
                 except Exception:
@@ -933,8 +971,6 @@ class CascadeDetector:
                 if evid:
                     attr = rank_candidates(cands, evid, dominant, self.pc, t_ref)
                     self._attr[eid] = attr
-            elif evid is None and fut.done():
-                pass
             if attr:
                 self.db.save_precursors(eid, attr)
                 best = attr[0]
@@ -943,7 +979,7 @@ class CascadeDetector:
                             best["score"], fmt_evidence(best),
                             ",".join(f"{r['symbol']}:{r['score']:.2f}" for r in attr))
         except asyncio.CancelledError:
-            if not sent:   # 程式關閉時仍要把 OPEN 警報送出（無前兆資料）
+            if not sent:
                 self._notify(self.tg_open, lambda: msg_open(eid, snap, self.window_s, None))
             raise
         except Exception:
@@ -951,7 +987,6 @@ class CascadeDetector:
             if not sent:
                 self._notify(self.tg_open, lambda: msg_open(eid, snap, self.window_s, None))
 
-    # ----------------------------------------------------------- 事件結束
     def _close(self, status: str) -> None:
         ev = self.event
         if ev is None:
@@ -975,7 +1010,6 @@ class CascadeDetector:
         )
         self._notify(self.tg_close, lambda: msg_close(ev, status, attr))
 
-    # ----------------------------------------------------------- 寫入資料庫
     def flush(self, now: float | None = None) -> None:
         try:
             if self.pending_liqs:
@@ -986,14 +1020,13 @@ class CascadeDetector:
                 if ev.pending:
                     self.db.add_timeline(ev.pending)
                     ev.pending.clear()
-                if now is not None and now - self._last_save >= 10:   # 每 10 秒更新一次事件摘要
+                if now is not None and now - self._last_save >= 10:
                     self.db.upsert_event(ev.to_row())
                     self._last_save = now
         except Exception:
             log.exception("database flush failed (will retry next tick)")
 
     async def drain(self) -> None:
-        """關閉時：取消進行中的前兆取數（其 CancelledError 處理會補送 OPEN 警報）。"""
         tasks = list(self._tasks)
         for t in tasks:
             t.cancel()
@@ -1013,7 +1046,7 @@ def handle_raw(raw: str | bytes, det: CascadeDetector) -> None:
     msg = json.loads(raw)
     items = msg if isinstance(msg, list) else [msg]
     for m in items:
-        if isinstance(m, dict) and "data" in m:   # 相容 combined stream 包裝
+        if isinstance(m, dict) and "data" in m:
             m = m["data"]
         liq = parse_force_order(m)
         if liq:
@@ -1042,7 +1075,7 @@ async def ws_loop(url: str, det: CascadeDetector) -> None:
             log.warning("connection closed by server (Binance rotates connections every ~24h)")
         except asyncio.CancelledError:
             raise
-        except Exception as e:  # 網路錯誤、握手失敗、逾時…
+        except Exception as e:
             log.warning("ws error: %s: %s", type(e).__name__, e)
         log.info("reconnecting in %.0fs", backoff)
         await asyncio.sleep(backoff)
@@ -1050,7 +1083,7 @@ async def ws_loop(url: str, det: CascadeDetector) -> None:
 
 
 # --------------------------------------------------------------------------
-# 模擬器：用合成資料走一遍完整流程（ETH 先爆 -> 擴散到其他幣種 -> 平息）
+# 模擬器
 # --------------------------------------------------------------------------
 async def simulate_feed(det: CascadeDetector, stop: asyncio.Event) -> None:
     prices = {"ETHUSDT": 3000, "SOLUSDT": 150, "BTCUSDT": 65000, "DOGEUSDT": 0.15,
@@ -1065,7 +1098,7 @@ async def simulate_feed(det: CascadeDetector, stop: asyncio.Event) -> None:
             n = random.randint(8, 15) if burst else random.randint(0, 1)
             for _ in range(n):
                 if burst and el < 12 and random.random() < 0.7:
-                    sym = "ETHUSDT"                       # 起火點先出現在 ETH
+                    sym = "ETHUSDT"
                 else:
                     sym = random.choice(syms if burst else syms[:3])
                 usd = random.uniform(20_000, 150_000) if burst else random.uniform(2_000, 30_000)
@@ -1093,7 +1126,7 @@ async def ticker(det: CascadeDetector, db: Database, retention_days: float) -> N
                      det.msg_count, fmt_usd(det.window.total), det.window.n_symbols,
                      det.event.id if det.event else "-")
             idle = now - (det.last_msg or det.started)
-            if idle > 300:   # 清算在 Binance 上幾乎隨時都在發生，5 分鐘完全沒資料通常代表訂閱路徑有問題
+            if idle > 300:
                 log.warning("no liquidation messages for %.0fs. If this persists, check source.ws_url "
                             "(Binance moved !forceOrder@arr to the /market path in 2026).", idle)
         if now - last_purge >= 3600:
@@ -1118,7 +1151,7 @@ async def run(cfg: dict, simulate: bool) -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, stop.set)
-        except (NotImplementedError, RuntimeError):   # Windows 不支援，改走 KeyboardInterrupt
+        except (NotImplementedError, RuntimeError):
             pass
 
     d = cfg["detection"]
@@ -1146,13 +1179,13 @@ async def run(cfg: dict, simulate: bool) -> None:
         await det.drain()
         det.shutdown()
         if notifier:
-            notifier.close()   # 等最後一則訊息送完
+            notifier.close()
         db.close()
         log.info("shutdown complete")
 
 
 # --------------------------------------------------------------------------
-# CLI：事件列表 / Replay / Telegram 測試
+# CLI：事件列表 / Replay / Telegram 測試 / Attribute / Probe
 # --------------------------------------------------------------------------
 def list_events(cfg: dict) -> None:
     if not Path(cfg["storage"]["path"]).exists():
@@ -1184,14 +1217,13 @@ def _find_events(db: Database, ref: str) -> list:
     if ref == "latest":
         return c.execute("SELECT * FROM events ORDER BY started_at DESC LIMIT 1").fetchall()
     rows = c.execute("SELECT * FROM events WHERE id=?", (ref,)).fetchall()
-    if not rows:   # 允許只輸入前綴，例如 20261101-1252
+    if not rows:
         rows = c.execute("SELECT * FROM events WHERE id LIKE ? ORDER BY started_at DESC",
                          (ref + "%",)).fetchall()
     return rows
 
 
 def replay(cfg: dict, ref: str, max_rows: int) -> int:
-    """從資料庫重建事件：摘要 -> 擴散順序 -> 強度分佈 -> 逐筆時間軸 -> 一致性檢查。純離線。"""
     path = cfg["storage"]["path"]
     if not Path(path).exists():
         print(f"database not found: {path}  (use --db to point at another file)")
@@ -1254,7 +1286,6 @@ def _print_replay(db: Database, ev, tl: list, max_rows: int) -> None:
     if ev["status"] != "closed":
         print(f" ⚠️  status is '{ev['status']}': the event did not end cleanly, totals may be partial")
 
-    # ---- 前兆證據（事件發生當下取得並存入 SQLite；replay 本身完全離線）
     if pre:
         ref = pre[0]["ref_ts"] or t0
         title = f"Precursor evidence (before first liquidation @ {_ts_ms(ref)} UTC)"
@@ -1276,7 +1307,6 @@ def _print_replay(db: Database, ev, tl: list, max_rows: int) -> None:
         print("\n── Precursor evidence " + "─" * (W - 22))
         print("  (none recorded: event predates this feature, or lookup was disabled / unavailable)")
 
-    # ---- 擴散順序：每個幣種第一次出現的時間
     seen: dict[str, list] = {}
     for r in tl:
         s = seen.setdefault(r["symbol"], [r["ts"], r["notional_usd"], 0.0])
@@ -1289,7 +1319,6 @@ def _print_replay(db: Database, ev, tl: list, max_rows: int) -> None:
         print(f"  #{i:<2} T+{fts - t0:7.2f}s  {sym:<12} first {fmt_usd(first_usd):>8}   "
               f"total {fmt_usd(tot):>9}")
 
-    # ---- 強度分佈
     bsec = max(1, math.ceil(dur / 20)) if dur > 0 else 1
     buckets: dict[int, list] = {}
     for r in tl:
@@ -1303,7 +1332,6 @@ def _print_replay(db: Database, ev, tl: list, max_rows: int) -> None:
         bar = "█" * int(round(30 * usd / mx))
         print(f"  T+{i * bsec:>4}s  {bar:<30} {fmt_usd(usd):>9}  ({n})")
 
-    # ---- 逐筆時間軸
     print("\n── Timeline " + "─" * (W - 12))
     print("  🔴 = long position liquidated   🟢 = short position liquidated")
     cum = 0.0
@@ -1321,7 +1349,6 @@ def _print_replay(db: Database, ev, tl: list, max_rows: int) -> None:
     if (ev["n_liquidations"] or 0) > len(tl):
         print(f"  note: timeline capped at {len(tl)} rows (max_timeline_rows); summary totals are complete")
 
-    # ---- 一致性檢查：事件時間軸 vs 原始爆倉表
     tl_sum = sum(r["notional_usd"] for r in tl)
     cnt, raw_sum = db.conn.execute(
         "SELECT COUNT(*), COALESCE(SUM(notional_usd), 0) FROM liquidations WHERE ts BETWEEN ? AND ?",
@@ -1339,16 +1366,130 @@ def _print_replay(db: Database, ev, tl: list, max_rows: int) -> None:
     print(" Replay read only the local SQLite file. No network, no live data.")
 
 
+def attribute(cfg: dict, ref: str) -> int:
+    path = cfg["storage"]["path"]
+    if not Path(path).exists():
+        print(f"database not found: {path}  (use --db to point at another file)")
+        return 1
+    db = Database(path)
+    try:
+        rows = _find_events(db, ref)
+        if not rows:
+            print(f"event '{ref}' not found. Try: python fusetrace.py --list-events")
+            return 1
+        if len(rows) > 1:
+            print(f"'{ref}' matches {len(rows)} events, be more specific:")
+            for r in rows:
+                print(f"  {r['id']}")
+            return 1
+        ev = rows[0]
+        eid = ev["id"]
+        pc = pc_params(cfg)
+        window_s = float(cfg["detection"]["window_seconds"])
+        lookback = int(cfg["precursor"]["lookback_minutes"])
+
+        t_ref = ev["first_ts"] or ev["started_at"]
+        if not t_ref:
+            print(f"event {eid} has no start time recorded; cannot attribute")
+            return 1
+
+        tl = db.conn.execute(
+            "SELECT symbol, side, SUM(notional_usd) AS usd, MIN(ts) AS first_ts FROM event_timeline "
+            "WHERE event_id=? AND ts>=? AND ts<=? GROUP BY symbol, side",
+            (eid, t_ref - 0.001, t_ref + window_s),
+        ).fetchall()
+        if not tl:
+            print(f"event {eid} has no timeline rows in the first {window_s:.0f}s; cannot attribute")
+            return 1
+        by_sym: dict[str, float] = {}
+        first_by: dict[str, float] = {}
+        long_usd = short_usd = 0.0
+        for r in tl:
+            by_sym[r["symbol"]] = by_sym.get(r["symbol"], 0.0) + r["usd"]
+            first_by[r["symbol"]] = min(first_by.get(r["symbol"], r["first_ts"]), r["first_ts"])
+            if r["side"] == "LONG":
+                long_usd += r["usd"]
+            else:
+                short_usd += r["usd"]
+        dominant = "LONG" if long_usd >= short_usd else "SHORT"
+
+        top = sorted(by_sym.items(), key=lambda kv: kv[1], reverse=True)[: pc["top_k"]]
+        syms = [s for s, _ in top]
+        fs = ev["first_symbol"]
+        if pc["include_first"] and fs and fs not in syms:
+            syms.append(fs)
+        cands = [(s, by_sym.get(s, 0.0), first_by.get(s, t_ref)) for s in syms]
+
+        print("═" * 70)
+        print(f" 🔬 FuseTrace ATTRIBUTE   event {eid}  [{ev['status']}]")
+        print("═" * 70)
+        print(f" Reference time : {_ts_full(t_ref)}   (lookback {lookback}m)")
+        print(f" Window         : first {window_s:.0f}s  |  dominant side: {dominant} liquidated "
+              f"(long {fmt_usd(long_usd)} / short {fmt_usd(short_usd)})")
+        print(f" Candidates     : {', '.join(syms)}")
+        age_days = (time.time() - t_ref) / 86400
+        if age_days > 30:
+            print(f" ⚠️  event is {age_days:.0f} days old: openInterestHist only keeps ~30 days, "
+                  f"OI evidence will be missing")
+
+        engine = make_engine({**cfg, "precursor": {**cfg["precursor"], "enabled": True}})
+        print(f" Querying Binance public REST ({len(syms)} symbols x 3 endpoints) ...")
+        evid = engine.collect(syms, t_ref, historical=True)
+
+        no_evidence = all(all(e[k] is None for k in ("price_pct", "oi_pct", "funding_pct"))
+                          for e in evid.values())
+        any_error = any(e["errors"] for e in evid.values())
+        if no_evidence and any_error:
+            print("\n ❌ every lookup failed, existing precursor data (if any) was left untouched:")
+            for s, e in evid.items():
+                print(f"    {s}: {'; '.join(e['errors'])}")
+            print("    Check your network / try `python fusetrace.py --probe ETHUSDT`, then re-run.")
+            return 1
+
+        attr = rank_candidates(cands, evid, dominant, pc, t_ref)
+        old_n = db.conn.execute("SELECT COUNT(*) FROM event_precursors WHERE event_id=?", (eid,)).fetchone()[0]
+        db.save_precursors(eid, attr)
+
+        print()
+        for r in attr:
+            star = "★" if r["is_ignition"] else " "
+            print(f"  {star} #{r['rank']} {r['symbol']:<12} score {r['score']:.2f}   {fmt_evidence(r)}")
+        failed = [(r["symbol"], json.loads(r["errors"] or "[]")) for r in attr]
+        failed = [(s, e) for s, e in failed if e]
+        if failed:
+            print("\n ⚠️  some lookups failed (those pieces count as 0 evidence); re-run to retry:")
+            for s, e in failed:
+                print(f"    {s}: {'; '.join(e)}")
+
+        best = attr[0]
+        print()
+        if best["is_ignition"]:
+            print(f" ✅ Precursors updated for {eid}: likely ignition = {best['symbol']} "
+                  f"(score {best['score']:.2f})")
+            if fs and best["symbol"] != fs:
+                print(f"    note: first liquidation was on {fs}, but {best['symbol']} shows stronger evidence")
+        else:
+            print(f" ✅ Precursors updated for {eid}: no clear ignition "
+                  f"(best score {best['score']:.2f} < min_score {pc['min_score']:.2f})")
+        print(f"    {len(attr)} candidates saved" + (f", replaced {old_n} old rows" if old_n else ""))
+        print(f"\n 👉 View the result:  python fusetrace.py --replay {eid}")
+        return 0
+    finally:
+        db.close()
+
+
 def probe(cfg: dict, symbol: str) -> int:
-    """冒煙測試：對單一幣種跑一次前兆取數，驗證三個公開 REST 端點在你的網路環境可用。"""
     cfg = {**cfg, "precursor": {**cfg["precursor"], "enabled": True}}
     engine = make_engine(cfg)
     sym = symbol.upper()
-    print(f"probing {sym} | base={cfg['source']['rest_url']} | lookback={cfg['precursor']['lookback_minutes']}m "
+    cm = is_coin_m(sym)
+    base = cfg["source"].get("dapi_rest_url", "https://dapi.binance.com") if cm else cfg["source"]["rest_url"]
+    print(f"probing {sym} ({'COIN-M' if cm else 'USD-M'}) | base={base} | lookback={cfg['precursor']['lookback_minutes']}m "
           f"| reference time = now-120s")
     ev = engine.collect([sym], time.time() - 120)[sym]
     print(json.dumps(ev, indent=2))
-    print(f"requests sent: {engine.rest.n_requests} | X-MBX-USED-WEIGHT-1M: {engine.rest.used_weight}")
+    rest_used = engine.dapi_rest if (cm and engine.dapi_rest) else engine.rest
+    print(f"requests sent: {rest_used.n_requests} | X-MBX-USED-WEIGHT-1M: {rest_used.used_weight}")
     ok = not ev["errors"]
     print("✅ klines / openInterestHist / premiumIndex all OK" if ok
           else "❌ some endpoints failed (see errors above)")
@@ -1362,8 +1503,8 @@ def test_telegram(cfg: dict) -> int:
               "or env FUSETRACE_TG_TOKEN / FUSETRACE_TG_CHAT_ID.")
         return 1
     ok = n.deliver("\n".join([
-        "🧪 *FuseTrace test message*",
-        md("If you can read this, Telegram alerts are working. ✅"),
+        "🧪 *FuseTrace 测试讯息*",
+        md("如果你能看到这条讯息，说明 Telegram 推送已正常工作。✅"),
     ]))
     n.close(1)
     print("✅ test message sent" if ok else "❌ failed to send (see log above)")
@@ -1380,6 +1521,8 @@ def main() -> None:
     ap.add_argument("--rows", type=int, default=60, help="max timeline rows in replay (0 = all)")
     ap.add_argument("--test-telegram", action="store_true", help="send a test message and exit")
     ap.add_argument("--probe", metavar="SYMBOL", help="smoke-test precursor REST endpoints, e.g. ETHUSDT")
+    ap.add_argument("--attribute", metavar="EVENT_ID",
+                    help="(re)run precursor attribution on a stored event ('latest' or id prefix ok)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -1391,6 +1534,8 @@ def main() -> None:
     if args.db:
         cfg["storage"]["path"] = args.db
 
+    if args.attribute:
+        sys.exit(attribute(cfg, args.attribute))
     if args.probe:
         sys.exit(probe(cfg, args.probe))
     if args.test_telegram:
@@ -1401,7 +1546,7 @@ def main() -> None:
     if args.replay:
         sys.exit(replay(cfg, args.replay, args.rows))
 
-    if args.simulate:   # 模擬模式使用獨立 DB 與較敏感的參數，避免污染正式資料
+    if args.simulate:
         if not args.db:
             cfg["storage"]["path"] = "fusetrace_sim.db"
         cfg["detection"].update(window_seconds=20, min_total_usd=2_000_000, min_symbols=3,
